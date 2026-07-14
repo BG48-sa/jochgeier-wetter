@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Jochgeier Wetter</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --bg: #10151c;
+    --panel: #1a222d;
+    --panel2: #212c3a;
+    --text: #e8eef5;
+    --muted: #8fa1b5;
+    --accent: #4da3ff;
+    --ok: #3fbf6f;
+    --warn: #f0b429;
+    --danger: #e5484d;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    overflow: hidden;
+  }
+  header {
+    padding: max(env(safe-area-inset-top), 8px) 14px 8px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; font-weight: 700; }
+  header .sub { font-size: 12px; color: var(--muted); }
+  #advice {
+    margin: 0 10px 8px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    background: var(--panel);
+    border-left: 4px solid var(--muted);
+  }
+  #advice.ok { border-color: var(--ok); }
+  #advice.warn { border-color: var(--warn); }
+  #advice.danger { border-color: var(--danger); }
+  #advice .detail { display: block; font-size: 12px; font-weight: 400; color: var(--muted); margin-top: 2px; }
+  #map { flex: 1; min-height: 240px; }
+  .leaflet-container { background: #0c1117; }
+  /* free RainViewer tiles are coarse (native z7) — soften the upscaled pixel blocks.
+     Blur the tile imgs, not the pane: a whole-pane filter makes one huge GPU layer
+     that can miss repaints while many images decode. */
+  .leaflet-radar-pane img.leaflet-tile { filter: blur(5px); }
+
+  /* animation control bar */
+  #anim {
+    background: var(--panel);
+    padding: 8px 12px calc(8px);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  #playBtn {
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #timeline { flex: 1; accent-color: var(--accent); }
+  #frameLabel {
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    min-width: 92px;
+    text-align: right;
+  }
+  #frameLabel .tag { display: block; font-size: 10px; color: var(--warn); }
+  #frameLabel .tag.past { color: var(--muted); }
+
+  #layerRow {
+    background: var(--panel);
+    display: flex;
+    gap: 8px;
+    padding: 0 12px 10px;
+    font-size: 12px;
+    align-items: center;
+  }
+  .toggle {
+    display: flex; align-items: center; gap: 5px;
+    background: var(--panel2);
+    border-radius: 8px;
+    padding: 5px 9px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle input { accent-color: var(--accent); }
+  #status { color: var(--muted); margin-left: auto; font-size: 11px; }
+
+  /* forecast strip */
+  #forecast {
+    background: var(--bg);
+    padding: 10px 10px max(env(safe-area-inset-bottom), 10px);
+  }
+  #forecast h2 { font-size: 12px; color: var(--muted); font-weight: 600; margin: 0 4px 6px; text-transform: uppercase; letter-spacing: .5px; }
+  #hours {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 4px;
+  }
+  .hour {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 8px 10px;
+    min-width: 86px;
+    flex-shrink: 0;
+    text-align: center;
+  }
+  .hour.now { outline: 1.5px solid var(--accent); }
+  .hour .t { font-size: 12px; color: var(--muted); }
+  .hour .icon { font-size: 22px; line-height: 1.3; }
+  .hour .temp { font-size: 14px; font-weight: 700; }
+  .hour .clouds { display: flex; gap: 2px; justify-content: center; margin: 5px 0 3px; }
+  .hour .clouds div {
+    width: 16px; height: 22px;
+    border-radius: 3px;
+    background: var(--panel2);
+    position: relative;
+    overflow: hidden;
+  }
+  .hour .clouds div::after {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: var(--h);
+    background: #7fa8cc;
+  }
+  .hour .clouds .lo::after { background: #9fb9d0; }
+  .hour .clouds .mi::after { background: #7fa0c4; }
+  .hour .clouds .hi::after { background: #5f83ab; }
+  .hour .rain { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .hour .rain b { color: var(--accent); }
+  .hour .cape { font-size: 10px; margin-top: 3px; color: var(--warn); font-weight: 700; }
+  .hour .wind { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .legendRow { display: flex; gap: 12px; font-size: 10px; color: var(--muted); margin: 6px 4px 0; }
+  .legendRow span::before { content: "■ "; }
+  .legendRow .l1::before { color: #9fb9d0; }
+  .legendRow .l2::before { color: #7fa0c4; }
+  .legendRow .l3::before { color: #5f83ab; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⛰️ Jochgeier</h1>
+  <span class="sub">1.895 m · Gem. Sarntal · 46,6331 N 11,3228 O</span>
+</header>
+
+<div id="advice"><span id="adviceText">Lade Wetterdaten …</span><span class="detail" id="adviceDetail"></span></div>
+
+<div id="map"></div>
+
+<div id="anim">
+  <button id="playBtn" title="Abspielen / Pause">▶</button>
+  <input type="range" id="timeline" min="0" max="0" value="0" step="1">
+  <div id="frameLabel">–:–</div>
+</div>
+<div id="layerRow">
+  <label class="toggle"><input type="checkbox" id="satToggle" checked> ☁️ Wolken (Satellit)</label>
+  <label class="toggle"><input type="checkbox" id="radarToggle" checked> 🌧 Regenradar</label>
+  <span id="status"></span>
+</div>
+
+<div id="forecast">
+  <h2>Punktprognose Jochgeier – nächste Stunden</h2>
+  <div id="hours"></div>
+  <div class="legendRow">
+    <span class="l1">tiefe Wolken (Nebel!)</span>
+    <span class="l2">mittlere</span>
+    <span class="l3">hohe</span>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const LAT = 46.633135, LON = 11.322837, ELEV = 1895;
+
+/* ---------- map ---------- */
+// fadeAnimation off: Leaflet's rAF-driven tile fade freezes in throttled/background
+// tabs and leaves tiles stuck half-transparent (dark boxes)
+const map = L.map('map', { zoomControl: true, attributionControl: true, fadeAnimation: false })
+  .setView([LAT, LON], 11);
+
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom: 15,
+  attribution: 'Karte: © Esri | Wolken: EUMETSAT | Radar: RainViewer'
+}).addTo(map);
+
+// stacking: satellite image (overlayPane, 400) < radar (450) < marker/rings (markerPane, 600)
+map.createPane('radar').style.zIndex = 450;
+
+// Jochgeier marker + reference rings (5 / 15 km)
+L.circleMarker([LAT, LON], { pane: 'markerPane', radius: 7, color: '#e5484d', weight: 3, fillColor: '#fff', fillOpacity: 1 })
+  .addTo(map).bindPopup('<b>Jochgeier</b><br>Hütte, 1.895 m');
+L.circle([LAT, LON], { pane: 'markerPane', radius: 5000, color: '#e5484d', weight: 1, dashArray: '4 6', fill: false, opacity: .6 }).addTo(map);
+L.circle([LAT, LON], { pane: 'markerPane', radius: 15000, color: '#e5484d', weight: 1, dashArray: '2 8', fill: false, opacity: .35 }).addTo(map);
+
+/* ---------- Cloud + rain animation ----------
+   Clouds:  EUMETSAT Meteosat (MTG) GeoColour via EUMETView WMS, 10-min imagery
+   Rain:    RainViewer radar (observed + nowcast)                              */
+const WMS_URL = 'https://view.eumetsat.int/geoserver/wms';
+const SAT_LAYER = 'mtg_fd:rgb_geocolour';
+const HISTORY_MIN = 120;   // show last 2 h of cloud movement
+const STEP_MIN = 10;
+
+const state = {
+  frames: [],          // [{time(unix), satIso|null, radarPath|null, isNowcast}]
+  layers: {},          // cache: key -> L.tileLayer / L.tileLayer.wms
+  idx: 0,
+  playing: false,
+  timer: null,
+  host: ''
+};
+
+const $ = id => document.getElementById(id);
+
+function fmtTime(unix) {
+  return new Date(unix * 1000).toLocaleTimeString('de-IT', { hour: '2-digit', minute: '2-digit' });
+}
+
+function makeSatLayer(iso) {
+  // ONE seamless GetMap image over the (padded) current view instead of 256px tiles:
+  // no tile seams, and requesting near the satellite's native ~1 km resolution lets
+  // the browser upscale smoothly instead of showing hard pixel blocks.
+  const b = map.getBounds().pad(0.35);
+  const sw = L.CRS.EPSG3857.project(b.getSouthWest());
+  const ne = L.CRS.EPSG3857.project(b.getNorthEast());
+  const wM = ne.x - sw.x, hM = ne.y - sw.y;
+  const w = Math.max(160, Math.min(1400, Math.round(wM / 500)));
+  const h = Math.max(120, Math.round(w * hM / wM));
+  const url = WMS_URL + '?service=WMS&version=1.3.0&request=GetMap' +
+    '&layers=' + encodeURIComponent(SAT_LAYER) + '&styles=' +
+    '&format=image%2Fpng&transparent=false&crs=EPSG%3A3857' +
+    `&bbox=${sw.x},${sw.y},${ne.x},${ne.y}&width=${w}&height=${h}` +
+    '&time=' + encodeURIComponent(iso);
+  // start with a transparent pixel; swap in the processed cloud mask when ready
+  const ov = L.imageOverlay(
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    b, { opacity: 0 });
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => { try { ov.setUrl(extractClouds(img)); } catch (e) { ov.setUrl(url); } };
+  img.src = url;
+  return ov;
+}
+
+// GeoColour photo -> cloud mask: clouds are bright AND unsaturated (white/gray),
+// terrain is colored (green/brown) -> becomes transparent so the map shows through.
+// Cloud thickness maps to opacity, so structure and movement stay readable.
+function extractClouds(img) {
+  const cv = document.createElement('canvas');
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  const cx = cv.getContext('2d');
+  cx.drawImage(img, 0, 0);
+  const d = cx.getImageData(0, 0, cv.width, cv.height);
+  const p = d.data;
+  // normalize per image: scenes dim toward dusk, so anchor thresholds to the
+  // 95th-percentile brightness instead of absolute values
+  const mins = [];
+  for (let i = 0; i < p.length; i += 16) {
+    mins.push(Math.min(p[i], p[i + 1], p[i + 2]));
+  }
+  mins.sort((x, y) => x - y);
+  const p95 = mins[Math.floor(mins.length * 0.95)] / 255;
+  const scale = 0.72 / Math.max(0.3, p95);
+  for (let i = 0; i < p.length; i += 4) {
+    const r = p[i], g = p[i + 1], b = p[i + 2];
+    const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
+    const wht = (mn / 255) * scale;
+    const sat = mx ? (mx - mn) / mx : 0;
+    const a = Math.max(0, Math.min(1, (wht - 0.30) / 0.30)) *
+              Math.max(0, Math.min(1, 1 - sat * 0.8));
+    // dark slate "cloud shadow" — white would vanish on the light base map
+    p[i] = 62; p[i + 1] = 78; p[i + 2] = 99;
+    p[i + 3] = Math.round(a * 215);
+  }
+  cx.putImageData(d, 0, 0);
+  return cv.toDataURL('image/png');
+}
+function makeRadarLayer(path) {
+  return L.tileLayer(`${state.host}${path}/256/{z}/{x}/{y}/4/1_1.png`,
+    { pane: 'radar', tileSize: 256, opacity: 0, maxNativeZoom: 7 });
+}
+
+// satellite images are view-dependent: rebuild them after pan/zoom
+let satRebuildTimer;
+map.on('moveend', () => {
+  clearTimeout(satRebuildTimer);
+  satRebuildTimer = setTimeout(() => {
+    Object.keys(state.layers).forEach(k => {
+      if (k.startsWith('sat')) { map.removeLayer(state.layers[k]); delete state.layers[k]; }
+    });
+    if (state.frames.length) {
+      showFrame(state.idx);
+      state.frames.forEach(f => { if (f.satIso) getLayer('sat' + f.satIso, () => makeSatLayer(f.satIso)); });
+    }
+  }, 400);
+});
+
+function getLayer(key, factory) {
+  if (!state.layers[key]) {
+    state.layers[key] = factory();
+    state.layers[key].addTo(map);
+  }
+  return state.layers[key];
+}
+
+function showFrame(i) {
+  const satOn = $('satToggle').checked;
+  const radarOn = $('radarToggle').checked;
+  state.idx = i;
+  const f = state.frames[i];
+  if (!f) return;
+  const wantSat = satOn && f.satIso ? 'sat' + f.satIso : null;
+  const wantRadar = radarOn && f.radarPath ? 'radar' + f.radarPath : null;
+  if (wantSat) getLayer(wantSat, () => makeSatLayer(f.satIso));
+  if (wantRadar) getLayer(wantRadar, () => makeRadarLayer(f.radarPath));
+  Object.entries(state.layers).forEach(([key, lyr]) => {
+    lyr.setOpacity(key === wantSat ? 0.9 : key === wantRadar ? 0.8 : 0);
+  });
+  $('timeline').value = i;
+  $('frameLabel').innerHTML = fmtTime(f.time) +
+    (f.isNowcast ? '<span class="tag">Radar-Prognose</span>' : '<span class="tag past">beobachtet</span>');
+}
+
+function play() {
+  state.playing = true;
+  $('playBtn').textContent = '⏸';
+  state.timer = setInterval(() => {
+    let next = state.idx + 1;
+    if (next >= state.frames.length) next = 0;
+    showFrame(next);
+  }, 700);
+}
+function pause() {
+  state.playing = false;
+  $('playBtn').textContent = '▶';
+  clearInterval(state.timer);
+}
+$('playBtn').onclick = () => state.playing ? pause() : play();
+$('timeline').oninput = e => { pause(); showFrame(+e.target.value); };
+$('satToggle').onchange = () => showFrame(state.idx);
+$('radarToggle').onchange = () => showFrame(state.idx);
+
+async function latestSatTime() {
+  // small per-layer capabilities doc contains the time dimension end
+  const res = await fetch(`https://view.eumetsat.int/geoserver/${SAT_LAYER.replace(':', '/')}/wms?service=WMS&version=1.3.0&request=GetCapabilities`);
+  const xml = await res.text();
+  const m = xml.match(/<Dimension name="time"[^>]*>.*?\/([0-9T:.\-]+Z)\/PT/s);
+  if (m) return new Date(m[1]).getTime();
+  // fallback: assume 25 min latency, rounded down to 10 min
+  const t = Date.now() - 25 * 60e3;
+  return Math.floor(t / (STEP_MIN * 60e3)) * STEP_MIN * 60e3;
+}
+
+async function loadFrames() {
+  const wasPlaying = state.playing;
+  try {
+    const [satEnd, rv] = await Promise.all([
+      latestSatTime(),
+      fetch('https://api.rainviewer.com/public/weather-maps.json').then(r => r.json()).catch(() => null)
+    ]);
+    state.host = rv?.host || 'https://tilecache.rainviewer.com';
+    const radar = [...(rv?.radar?.past || []), ...(rv?.radar?.nowcast || [])];
+    const nowcastStart = (rv?.radar?.nowcast || [])[0]?.time ?? Infinity;
+    const nearestRadar = tUnix => {
+      let best = null, bd = Infinity;
+      for (const r of radar) { const d = Math.abs(r.time - tUnix); if (d < bd) { bd = d; best = r; } }
+      return bd <= 6 * 60 ? best : null;
+    };
+
+    const frames = [];
+    for (let ms = satEnd - HISTORY_MIN * 60e3; ms <= satEnd; ms += STEP_MIN * 60e3) {
+      const unix = Math.round(ms / 1000);
+      frames.push({
+        time: unix,
+        satIso: new Date(ms).toISOString().replace(/\.\d+Z$/, '.000Z'),
+        radarPath: nearestRadar(unix)?.path || null,
+        isNowcast: false
+      });
+    }
+    // radar nowcast frames beyond the newest satellite image (rain forecast ~+30 min)
+    radar.filter(r => r.time >= nowcastStart && r.time * 1000 > satEnd)
+      .forEach(r => frames.push({ time: r.time, satIso: null, radarPath: r.path, isNowcast: true }));
+
+    // drop layers that no longer belong to any frame
+    const wanted = new Set();
+    frames.forEach(f => { if (f.satIso) wanted.add('sat' + f.satIso); if (f.radarPath) wanted.add('radar' + f.radarPath); });
+    Object.keys(state.layers).forEach(key => {
+      if (!wanted.has(key)) { map.removeLayer(state.layers[key]); delete state.layers[key]; }
+    });
+
+    state.frames = frames;
+    $('timeline').max = frames.length - 1;
+    // preload
+    frames.forEach(f => {
+      if (f.satIso) getLayer('sat' + f.satIso, () => makeSatLayer(f.satIso));
+      if (f.radarPath) getLayer('radar' + f.radarPath, () => makeRadarLayer(f.radarPath));
+    });
+    const lastObserved = frames.map(f => f.isNowcast).lastIndexOf(false);
+    showFrame(lastObserved >= 0 ? lastObserved : 0);
+    $('status').textContent = 'Satellitenbild: ' + fmtTime(satEnd / 1000) + ' · Bilder ' +
+      fmtTime(frames[0].time) + '–' + fmtTime(frames.at(-1).time);
+    if (wasPlaying || !state.timer) play();
+  } catch (e) {
+    $('status').textContent = 'Satellit/Radar nicht erreichbar';
+  }
+}
+loadFrames();
+setInterval(loadFrames, 5 * 60 * 1000); // refresh frames every 5 min
+
+/* ---------- Open-Meteo point forecast ---------- */
+function windArrow(degFrom) {
+  // arrow points where wind goes
+  const arrows = ['↓','↙','←','↖','↑','↗','→','↘'];
+  return arrows[Math.round(((degFrom + 180) % 360) / 45) % 8];
+}
+function skyIcon(low, mid, high, precip, cape) {
+  if (precip >= 0.5 && cape > 800) return '⛈';
+  if (precip >= 0.1) return '🌧';
+  const tot = Math.max(low, mid, high);
+  if (low >= 70) return '🌫';
+  if (tot >= 80) return '☁️';
+  if (tot >= 40) return '⛅';
+  return '☀️';
+}
+
+async function loadForecast() {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&elevation=${ELEV}` +
+    `&hourly=temperature_2m,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,precipitation_probability,cape,wind_speed_10m,wind_direction_10m,wind_gusts_10m` +
+    `&minutely_15=precipitation` +
+    `&forecast_days=2&timezone=Europe%2FRome&wind_speed_unit=kmh`;
+  try {
+    const d = await (await fetch(url)).json();
+    renderHours(d);
+    renderAdvice(d);
+  } catch (e) {
+    $('adviceText').textContent = 'Wetterdaten nicht erreichbar';
+  }
+}
+
+function renderHours(d) {
+  const h = d.hourly;
+  const now = new Date();
+  const startIdx = h.time.findIndex(t => new Date(t) >= new Date(now.getTime() - 3600e3));
+  const wrap = $('hours');
+  wrap.innerHTML = '';
+  for (let i = startIdx; i < Math.min(startIdx + 14, h.time.length); i++) {
+    const time = new Date(h.time[i]);
+    const low = h.cloud_cover_low[i], mid = h.cloud_cover_mid[i], high = h.cloud_cover_high[i];
+    const precip = h.precipitation[i], prob = h.precipitation_probability[i], cape = h.cape[i];
+    const el = document.createElement('div');
+    el.className = 'hour' + (i === startIdx ? ' now' : '');
+    el.innerHTML = `
+      <div class="t">${i === startIdx ? 'jetzt' : time.toLocaleTimeString('de-IT', { hour: '2-digit', minute: '2-digit' })}</div>
+      <div class="icon">${skyIcon(low, mid, high, precip, cape)}</div>
+      <div class="temp">${Math.round(h.temperature_2m[i])}°</div>
+      <div class="clouds" title="tief ${low}% · mittel ${mid}% · hoch ${high}%">
+        <div class="lo" style="--h:${low}%"></div>
+        <div class="mi" style="--h:${mid}%"></div>
+        <div class="hi" style="--h:${high}%"></div>
+      </div>
+      <div class="rain">${precip > 0 ? `<b>${precip.toFixed(1)} mm</b> · ` : ''}${prob != null ? prob + '%' : ''}</div>
+      ${cape >= 800 ? `<div class="cape">⚡ CAPE ${Math.round(cape)}</div>` : ''}
+      <div class="wind">${windArrow(h.wind_direction_10m[i])} ${Math.round(h.wind_speed_10m[i])} km/h</div>`;
+    wrap.appendChild(el);
+  }
+}
+
+function renderAdvice(d) {
+  const adv = $('advice'), txt = $('adviceText'), det = $('adviceDetail');
+  const now = Date.now();
+
+  // 1) next precipitation within 2 h (15-min resolution)
+  let rainInMin = null;
+  const m = d.minutely_15;
+  if (m) {
+    for (let i = 0; i < m.time.length; i++) {
+      const t = new Date(m.time[i]).getTime();
+      if (t < now - 15 * 60e3 || t > now + 120 * 60e3) continue;
+      if (m.precipitation[i] >= 0.1) { rainInMin = Math.max(0, Math.round((t - now) / 60e3)); break; }
+    }
+  }
+
+  // 2) thunderstorm potential next 6 h
+  const h = d.hourly;
+  let maxCape = 0, capeAt = null;
+  for (let i = 0; i < h.time.length; i++) {
+    const t = new Date(h.time[i]).getTime();
+    if (t < now - 3600e3 || t > now + 6 * 3600e3) continue;
+    if (h.cape[i] > maxCape) { maxCape = h.cape[i]; capeAt = h.time[i]; }
+  }
+
+  if (rainInMin !== null && rainInMin <= 30) {
+    adv.className = 'danger';
+    txt.textContent = rainInMin === 0 ? '🌧 Niederschlag jetzt – absteigen!' : `🌧 Niederschlag in ca. ${rainInMin} min`;
+    det.textContent = 'Radar unten prüfen: Zugrichtung der Zellen beachten.';
+  } else if (rainInMin !== null) {
+    adv.className = 'warn';
+    txt.textContent = `🌦 Niederschlag in ca. ${Math.round(rainInMin / 15) * 15} min erwartet`;
+    det.textContent = 'Rechtzeitig Abstieg planen (Sarner Skihütte ≈ 45 min, Putzen ≈ 1½ h).';
+  } else if (maxCape >= 1500) {
+    adv.className = 'danger';
+    txt.textContent = '⚡ Hohe Gewitterneigung heute';
+    det.textContent = `CAPE bis ${Math.round(maxCape)} J/kg um ${new Date(capeAt).toLocaleTimeString('de-IT', { hour: '2-digit', minute: '2-digit' })} – exponierten Grat meiden.`;
+  } else if (maxCape >= 800) {
+    adv.className = 'warn';
+    txt.textContent = '⚡ Gewitter am Nachmittag möglich';
+    det.textContent = `CAPE bis ${Math.round(maxCape)} J/kg – Radar im Blick behalten.`;
+  } else {
+    adv.className = 'ok';
+    txt.textContent = '✅ Kein Niederschlag in den nächsten 2 h erwartet';
+    det.textContent = maxCape > 0 ? `Gewitterpotenzial gering (CAPE max. ${Math.round(maxCape)} J/kg in 6 h).` : '';
+  }
+}
+loadForecast();
+setInterval(loadForecast, 10 * 60 * 1000);
+</script>
+</body>
+</html>
