@@ -58,6 +58,8 @@
      Blur the tile imgs, not the pane: a whole-pane filter makes one huge GPU layer
      that can miss repaints while many images decode. */
   .leaflet-radar-pane img.leaflet-tile { filter: blur(5px); }
+  /* soften the thresholded cloud mask's coarse pixel edges */
+  .leaflet-overlay-pane img.leaflet-image-layer { filter: blur(4px); }
 
   /* animation control bar */
   #anim {
@@ -104,7 +106,21 @@
     user-select: none;
   }
   .toggle input { accent-color: var(--accent); }
+  button.toggle { border: none; color: var(--text); font-size: 12px; font-family: inherit; }
+  button.toggle.armed { background: var(--danger); font-weight: 700; }
   #status { color: var(--muted); margin-left: auto; font-size: 11px; }
+
+  /* full-screen storm alarm */
+  body.alarm-flash::before {
+    content: "⛈ GEWITTER IM ANZUG – ABSTEIGEN!";
+    position: fixed; inset: 0; z-index: 2000;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(170, 25, 35, .88);
+    color: #fff; font-size: clamp(24px, 7vw, 64px); font-weight: 800;
+    text-align: center; padding: 20px;
+    animation: alarmpulse 0.8s infinite alternate;
+  }
+  @keyframes alarmpulse { from { opacity: 1; } to { opacity: .55; } }
 
   /* forecast strip */
   #forecast {
@@ -179,6 +195,7 @@
 <div id="layerRow">
   <label class="toggle"><input type="checkbox" id="satToggle" checked> ☁️ Wolken (Satellit)</label>
   <label class="toggle"><input type="checkbox" id="radarToggle" checked> 🌧 Regenradar</label>
+  <button id="alarmBtn" class="toggle" title="Warnt mit Sirene und Meldung, wenn eine Gewitterzelle heranzieht. Funktioniert, solange die App geöffnet ist.">🔕 Alarm aus</button>
   <span id="status"></span>
 </div>
 
@@ -423,6 +440,7 @@ async function loadFrames() {
     $('status').textContent = 'Satellitenbild: ' + fmtTime(satEnd / 1000) + ' · Bilder ' +
       fmtTime(frames[0].time) + '–' + fmtTime(frames.at(-1).time);
     if (wasPlaying || !state.timer) play();
+    updateAdvice();   // storm scan on fresh radar frames
   } catch (e) {
     $('status').textContent = 'Satellit/Radar nicht erreichbar';
   }
@@ -446,6 +464,121 @@ function skyIcon(low, mid, high, precip, cape) {
   return '☀️';
 }
 
+/* ---------- storm approach detection (radar pixel analysis around the hut) ---------- */
+const RZ = 7, TPX = 256;                       // RainViewer free tier: max zoom 7
+const N_TILES = TPX * Math.pow(2, RZ);
+const HUTPX = {
+  x: (LON + 180) / 360 * N_TILES,
+  y: (1 - Math.asinh(Math.tan(LAT * Math.PI / 180)) / Math.PI) / 2 * N_TILES
+};
+const M_PER_PX = 40075016.686 * Math.cos(LAT * Math.PI / 180) / N_TILES; // ≈ 840 m
+const SCAN_KM = 60;
+
+async function radarEchoNear(path) {
+  const rPx = Math.ceil(SCAN_KM * 1000 / M_PER_PX);
+  const x0 = Math.floor((HUTPX.x - rPx) / TPX), x1 = Math.floor((HUTPX.x + rPx) / TPX);
+  const y0 = Math.floor((HUTPX.y - rPx) / TPX), y1 = Math.floor((HUTPX.y + rPx) / TPX);
+  const cv = document.createElement('canvas');
+  cv.width = (x1 - x0 + 1) * TPX; cv.height = (y1 - y0 + 1) * TPX;
+  const cx = cv.getContext('2d', { willReadFrequently: true });
+  await Promise.all(Array.from((function* () {
+    for (let tx = x0; tx <= x1; tx++) for (let ty = y0; ty <= y1; ty++) yield [tx, ty];
+  })()).map(([tx, ty]) => new Promise(res => {
+    const im = new Image();
+    im.crossOrigin = 'anonymous';
+    im.onload = () => { cx.drawImage(im, (tx - x0) * TPX, (ty - y0) * TPX); res(); };
+    im.onerror = res;
+    im.src = `${state.host}${path}/256/${RZ}/${tx}/${ty}/4/1_1.png`;
+  })));
+  const ox = HUTPX.x - x0 * TPX, oy = HUTPX.y - y0 * TPX;
+  const d = cx.getImageData(0, 0, cv.width, cv.height).data;
+  let dist = null, strong = null, bearing = null;
+  for (let py = 0; py < cv.height; py++) {
+    for (let px = 0; px < cv.width; px++) {
+      const i = (py * cv.width + px) * 4;
+      if (d[i + 3] < 90) continue;                    // no echo
+      const dx = px - ox, dy = py - oy;
+      const km = Math.hypot(dx, dy) * M_PER_PX / 1000;
+      if (km > SCAN_KM) continue;
+      if (dist === null || km < dist) { dist = km; bearing = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360; }
+      if (d[i] > 140 && (strong === null || km < strong)) strong = km; // yellow/orange/red core
+    }
+  }
+  return { dist, strong, bearing };
+}
+
+// distance trend over the last ~30 min of observed radar -> approach speed & ETA
+async function analyzeStorm() {
+  const frames = state.frames.filter(f => f.radarPath && !f.isNowcast).slice(-4);
+  if (frames.length < 2) return null;
+  const res = [];
+  for (const f of frames) res.push({ t: f.time, ...(await radarEchoNear(f.radarPath)) });
+  const val = r => r.strong ?? r.dist;
+  const newest = res.at(-1);
+  if (val(newest) == null) return { none: true };
+  const oldest = res.find(r => val(r) != null);
+  let speed = null; // km/min, positive = approaching
+  if (oldest && oldest !== newest && (newest.t - oldest.t) >= 9 * 60) {
+    speed = (val(oldest) - val(newest)) / ((newest.t - oldest.t) / 60);
+  }
+  return {
+    dist: val(newest),
+    strongNow: newest.strong != null,
+    bearing: newest.bearing,
+    speed,
+    eta: speed > 0.08 ? Math.round(val(newest) / speed) : null
+  };
+}
+
+/* ---------- alarm ---------- */
+let alarmArmed = localStorage.getItem('alarmArmed') === '1';
+let lastAlarmAt = 0;
+let audioCtx;
+function tone(freqPlan, dur, vol) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const g = audioCtx.createGain(); g.connect(audioCtx.destination); g.gain.value = vol;
+    const o = audioCtx.createOscillator(); o.type = 'square'; o.connect(g);
+    const t0 = audioCtx.currentTime;
+    freqPlan.forEach(([at, f]) => o.frequency.setValueAtTime(f, t0 + at));
+    o.start(t0); o.stop(t0 + dur);
+  } catch (e) {}
+}
+function siren() {
+  tone([[0, 900], [0.4, 600], [0.8, 900], [1.2, 600], [1.6, 900], [2.0, 600], [2.4, 900]], 3, 0.5);
+  setTimeout(() => tone([[0, 900], [0.4, 600], [0.8, 900], [1.2, 600]], 1.6, 0.5), 4000);
+}
+function fireAlarm(text) {
+  if (Date.now() - lastAlarmAt < 15 * 60e3) return;   // max every 15 min
+  lastAlarmAt = Date.now();
+  siren();
+  if (navigator.vibrate) navigator.vibrate([600, 200, 600, 200, 900]);
+  document.body.classList.add('alarm-flash');
+  try {
+    if ('Notification' in window && Notification.permission === 'granted')
+      new Notification('⛈ Jochgeier: Abstieg empfohlen!', { body: text });
+  } catch (e) {}
+}
+document.body.addEventListener('click', () => document.body.classList.remove('alarm-flash'));
+function updateAlarmBtn() {
+  const b = $('alarmBtn');
+  b.textContent = alarmArmed ? '🔔 Alarm EIN' : '🔕 Alarm aus';
+  b.classList.toggle('armed', alarmArmed);
+}
+$('alarmBtn').onclick = async () => {
+  alarmArmed = !alarmArmed;
+  localStorage.setItem('alarmArmed', alarmArmed ? '1' : '0');
+  updateAlarmBtn();
+  if (alarmArmed) {
+    tone([[0, 880]], 0.15, 0.3);   // user gesture unlocks audio for later
+    try {
+      if ('Notification' in window && Notification.permission === 'default')
+        await Notification.requestPermission();
+    } catch (e) {}
+  }
+};
+updateAlarmBtn();
+
 async function loadForecast() {
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&elevation=${ELEV}` +
     `&hourly=temperature_2m,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,precipitation_probability,cape,wind_speed_10m,wind_direction_10m,wind_gusts_10m` +
@@ -453,8 +586,9 @@ async function loadForecast() {
     `&forecast_days=2&timezone=Europe%2FRome&wind_speed_unit=kmh`;
   try {
     const d = await (await fetch(url)).json();
+    state.lastForecast = d;
     renderHours(d);
-    renderAdvice(d);
+    updateAdvice();
   } catch (e) {
     $('adviceText').textContent = 'Wetterdaten nicht erreichbar';
   }
@@ -488,11 +622,22 @@ function renderHours(d) {
   }
 }
 
-function renderAdvice(d) {
+const DIR8 = ['N', 'NO', 'O', 'SO', 'S', 'SW', 'W', 'NW'];
+const dirTxt = b => DIR8[Math.round(b / 45) % 8];
+
+let advBusy = false;
+async function updateAdvice() {
+  const d = state.lastForecast;
+  if (!d || advBusy) return;
+  advBusy = true;
   const adv = $('advice'), txt = $('adviceText'), det = $('adviceDetail');
   const now = Date.now();
 
-  // 1) next precipitation within 2 h (15-min resolution)
+  // 1) live radar: nearest cell, approach speed, ETA
+  let storm = null;
+  try { storm = await analyzeStorm(); } catch (e) {}
+
+  // 2) next precipitation at the hut within 2 h (15-min model)
   let rainInMin = null;
   const m = d.minutely_15;
   if (m) {
@@ -503,7 +648,7 @@ function renderAdvice(d) {
     }
   }
 
-  // 2) thunderstorm potential next 6 h
+  // 3) thunderstorm potential next 6 h
   const h = d.hourly;
   let maxCape = 0, capeAt = null;
   for (let i = 0; i < h.time.length; i++) {
@@ -512,30 +657,58 @@ function renderAdvice(d) {
     if (h.cape[i] > maxCape) { maxCape = h.cape[i]; capeAt = h.time[i]; }
   }
 
-  if (rainInMin !== null && rainInMin <= 30) {
-    adv.className = 'danger';
-    txt.textContent = rainInMin === 0 ? '🌧 Niederschlag jetzt – absteigen!' : `🌧 Niederschlag in ca. ${rainInMin} min`;
-    det.textContent = 'Radar unten prüfen: Zugrichtung der Zellen beachten.';
+  let level = 'ok', main = '', detail = '';
+  const s = storm && !storm.none ? storm : null;
+  const icon = s && s.strongNow ? '⛈' : '🌧';
+
+  if (s && s.dist <= 5) {
+    level = 'danger';
+    main = `${icon} Zelle nur ${Math.max(1, Math.round(s.dist))} km entfernt (${dirTxt(s.bearing)}) – absteigen!`;
+    detail = 'Blitzschlaggefahr am Grat. Sofort tiefer gehen, Kuppen und freistehende Bäume meiden.';
+  } else if (s && s.eta !== null && s.eta <= 45 && (s.strongNow || maxCape >= 600)) {
+    level = 'danger';
+    main = `⛈ Gewitter im Anzug aus ${dirTxt(s.bearing)}: Zelle in ${Math.round(s.dist)} km, bei dir in ca. ${Math.max(5, Math.round(s.eta / 5) * 5)} min`;
+    detail = 'Jetzt aufbrechen: Sarner Skihütte ≈ 45 min, Putzen ≈ 1½ h Abstieg.';
+  } else if (rainInMin !== null && rainInMin <= 30) {
+    level = 'danger';
+    main = rainInMin === 0 ? '🌧 Niederschlag jetzt – absteigen!' : `🌧 Niederschlag in ca. ${rainInMin} min`;
+    detail = 'Radar unten prüfen: Zugrichtung der Zellen beachten.';
+  } else if (s && s.dist <= 25) {
+    level = 'warn';
+    main = `${icon} Zelle in ${Math.round(s.dist)} km (${dirTxt(s.bearing)})${s.eta ? `, nähert sich – ca. ${Math.round(s.eta / 5) * 5} min` : ', zieht derzeit nicht direkt heran'}`;
+    detail = 'Radar-Loop beobachten und Abstieg vorbereiten.';
   } else if (rainInMin !== null) {
-    adv.className = 'warn';
-    txt.textContent = `🌦 Niederschlag in ca. ${Math.round(rainInMin / 15) * 15} min erwartet`;
-    det.textContent = 'Rechtzeitig Abstieg planen (Sarner Skihütte ≈ 45 min, Putzen ≈ 1½ h).';
+    level = 'warn';
+    main = `🌦 Niederschlag in ca. ${Math.round(rainInMin / 15) * 15} min erwartet`;
+    detail = 'Rechtzeitig Abstieg planen (Sarner Skihütte ≈ 45 min, Putzen ≈ 1½ h).';
   } else if (maxCape >= 1500) {
-    adv.className = 'danger';
-    txt.textContent = '⚡ Hohe Gewitterneigung heute';
-    det.textContent = `CAPE bis ${Math.round(maxCape)} J/kg um ${new Date(capeAt).toLocaleTimeString('de-IT', { hour: '2-digit', minute: '2-digit' })} – exponierten Grat meiden.`;
+    level = 'danger';
+    main = '⚡ Hohe Gewitterneigung heute';
+    detail = `CAPE bis ${Math.round(maxCape)} J/kg um ${new Date(capeAt).toLocaleTimeString('de-IT', { hour: '2-digit', minute: '2-digit' })} – exponierten Grat meiden.`;
   } else if (maxCape >= 800) {
-    adv.className = 'warn';
-    txt.textContent = '⚡ Gewitter am Nachmittag möglich';
-    det.textContent = `CAPE bis ${Math.round(maxCape)} J/kg – Radar im Blick behalten.`;
+    level = 'warn';
+    main = '⚡ Gewitter möglich';
+    detail = `CAPE bis ${Math.round(maxCape)} J/kg – Radar im Blick behalten.`;
   } else {
-    adv.className = 'ok';
-    txt.textContent = '✅ Kein Niederschlag in den nächsten 2 h erwartet';
-    det.textContent = maxCape > 0 ? `Gewitterpotenzial gering (CAPE max. ${Math.round(maxCape)} J/kg in 6 h).` : '';
+    level = 'ok';
+    main = s === null || (storm && storm.none)
+      ? `✅ Kein Niederschlagsecho im Umkreis von ${SCAN_KM} km`
+      : '✅ Kein Niederschlag in den nächsten 2 h erwartet';
+    detail = maxCape > 0 ? `Gewitterpotenzial gering (CAPE max. ${Math.round(maxCape)} J/kg in 6 h).` : '';
   }
+
+  adv.className = level;
+  txt.textContent = main;
+  det.textContent = detail;
+
+  // alarm on any danger condition involving approaching weather (not pure CAPE outlook)
+  const acute = level === 'danger' && (s ? (s.dist <= 5 || (s.eta !== null && s.eta <= 45)) : rainInMin !== null && rainInMin <= 30);
+  if (alarmArmed && acute) fireAlarm(main);
+  advBusy = false;
 }
 loadForecast();
 setInterval(loadForecast, 10 * 60 * 1000);
+setInterval(updateAdvice, 5 * 60 * 1000);
 </script>
 </body>
 </html>
