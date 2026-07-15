@@ -59,7 +59,7 @@
      that can miss repaints while many images decode. */
   .leaflet-radar-pane img.leaflet-tile { filter: blur(5px); }
   /* soften the thresholded cloud mask's coarse pixel edges */
-  .leaflet-overlay-pane img.leaflet-image-layer { filter: blur(4px); }
+  .leaflet-overlay-pane img.leaflet-image-layer { filter: blur(3px); }
 
   /* animation control bar */
   #anim {
@@ -238,12 +238,22 @@ L.circle([LAT, LON], { pane: 'markerPane', radius: 15000, color: '#e5484d', weig
    Rain:    RainViewer radar (observed + nowcast)                              */
 const WMS_URL = 'https://view.eumetsat.int/geoserver/wms';
 const SAT_LAYER = 'mtg_fd:rgb_geocolour';
-const HISTORY_MIN = 120;   // show last 2 h of cloud movement
+const HISTORY_MIN = 60;    // observed cloud movement: last hour is enough
+const FORECAST_MIN = 30;   // extend the loop at least this far past "now"
 const STEP_MIN = 10;
+// satellite images are fetched PAD beyond the viewport on each side, so the
+// extrapolated (shifted) cloud mask still has real data at its edges
+const PAD = 0.75;
+const BLANK_PX = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 
 const state = {
-  frames: [],          // [{time(unix), satIso|null, radarPath|null, isNowcast}]
-  layers: {},          // cache: key -> L.tileLayer / L.tileLayer.wms
+  frames: [],          // [{time(unix), satIso|null, fcMin|null, radarPath|null, isNowcast}]
+  layers: {},          // cache: key -> L.tileLayer / L.imageOverlay
+  satData: {},         // iso -> Promise<canvas|null> (processed cloud mask)
+  satBounds: null,     // bounds all sat/forecast overlays share for the current view
+  satEnd: 0,           // ms of newest satellite image
+  baseIso: null,       // iso of newest satellite image (extrapolation base)
+  motion: undefined,   // cached Promise<{vx,vy}|null>, full-res px per minute
   idx: 0,
   playing: false,
   timer: null,
@@ -256,11 +266,18 @@ function fmtTime(unix) {
   return new Date(unix * 1000).toLocaleTimeString('de-IT', { hour: '2-digit', minute: '2-digit' });
 }
 
+// swapping a data-URL src on an already-mounted, blur-filtered img can leave a
+// stale GPU texture (the new image never paints); re-adding the layer forces a
+// fresh rasterize. setOpacity state survives via options.opacity.
+function remount(ov) {
+  if (ov._map) { const m = ov._map; m.removeLayer(ov); ov.addTo(m); }
+}
+
 function makeSatLayer(iso) {
   // ONE seamless GetMap image over the (padded) current view instead of 256px tiles:
   // no tile seams, and requesting near the satellite's native ~1 km resolution lets
   // the browser upscale smoothly instead of showing hard pixel blocks.
-  const b = map.getBounds().pad(0.35);
+  const b = state.satBounds = state.satBounds || map.getBounds().pad(PAD);
   const sw = L.CRS.EPSG3857.project(b.getSouthWest());
   const ne = L.CRS.EPSG3857.project(b.getNorthEast());
   const wM = ne.x - sw.x, hM = ne.y - sw.y;
@@ -272,13 +289,17 @@ function makeSatLayer(iso) {
     `&bbox=${sw.x},${sw.y},${ne.x},${ne.y}&width=${w}&height=${h}` +
     '&time=' + encodeURIComponent(iso);
   // start with a transparent pixel; swap in the processed cloud mask when ready
-  const ov = L.imageOverlay(
-    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-    b, { opacity: 0 });
-  const img = new Image();
-  img.crossOrigin = 'anonymous';
-  img.onload = () => { try { ov.setUrl(extractClouds(img)); } catch (e) { ov.setUrl(url); } };
-  img.src = url;
+  const ov = L.imageOverlay(BLANK_PX, b, { opacity: 0 });
+  state.satData[iso] = new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try { const cv = extractClouds(img); ov.setUrl(cv.toDataURL('image/png')); remount(ov); resolve(cv); }
+      catch (e) { ov.setUrl(url); remount(ov); resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
   return ov;
 }
 
@@ -306,18 +327,109 @@ function extractClouds(img) {
     const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
     const wht = (mn / 255) * scale;
     const sat = mx ? (mx - mn) / mx : 0;
-    const a = Math.max(0, Math.min(1, (wht - 0.30) / 0.30)) *
+    // earlier onset + steeper ramp + gamma lift: thin clouds stay clearly visible
+    const a = Math.max(0, Math.min(1, (wht - 0.24) / 0.22)) *
               Math.max(0, Math.min(1, 1 - sat * 0.8));
     // dark slate "cloud shadow" — white would vanish on the light base map
-    p[i] = 62; p[i + 1] = 78; p[i + 2] = 99;
-    p[i + 3] = Math.round(a * 215);
+    p[i] = 45; p[i + 1] = 58; p[i + 2] = 80;
+    p[i + 3] = Math.round(Math.pow(a, 0.8) * 240);
   }
   cx.putImageData(d, 0, 0);
-  return cv.toDataURL('image/png');
+  return cv;
 }
 function makeRadarLayer(path) {
   return L.tileLayer(`${state.host}${path}/256/{z}/{x}/{y}/4/1_1.png`,
     { pane: 'radar', tileSize: 256, opacity: 0, maxNativeZoom: 7 });
+}
+
+/* ---------- cloud motion nowcast ----------
+   The satellite feed runs ~30 min behind real time, so the loop used to end in
+   the past. Fix: measure how the cloud mask shifted between the oldest and
+   newest satellite frames (brute-force block matching on the downscaled alpha
+   channel) and push the newest mask forward along that vector for the future
+   frames. Cheap, and good enough for "will that cloud bank reach the hut". */
+function getMotion() {
+  if (state.motion !== undefined) return state.motion;
+  state.motion = (async () => {
+    const sats = state.frames.filter(f => f.satIso);
+    if (sats.length < 2) return null;
+    const fB = sats.at(-1);
+    const fA = sats[Math.max(0, sats.length - 4)];   // ~30 min apart
+    const [a, b] = await Promise.all([state.satData[fA.satIso], state.satData[fB.satIso]]);
+    if (!a || !b || a.width !== b.width || a.height !== b.height) return null;
+    const G = 96, gh = Math.max(28, Math.round(G * a.height / a.width));
+    const grid = cv => {
+      const c = document.createElement('canvas');
+      c.width = G; c.height = gh;
+      const g2 = c.getContext('2d');
+      g2.drawImage(cv, 0, 0, G, gh);
+      const dd = g2.getImageData(0, 0, G, gh).data;
+      const out = new Float32Array(G * gh);
+      for (let i = 0; i < out.length; i++) out[i] = dd[i * 4 + 3];
+      return out;
+    };
+    const A = grid(a), B = grid(b);
+    let sum = 0; for (const v of B) sum += v;
+    if (sum / B.length < 4) return null;             // (almost) cloud-free: nothing to track
+    const R = Math.min(12, Math.floor((Math.min(G, gh) - 6) / 2));
+    let best = null, err0 = 0;
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+      let err = 0, n = 0;
+      for (let y = R; y < gh - R; y += 2) for (let x = R; x < G - R; x += 2) {
+        err += Math.abs(A[y * G + x] - B[(y + dy) * G + (x + dx)]); n++;
+      }
+      err /= n;
+      if (!dx && !dy) err0 = err;
+      if (!best || err < best.err) best = { dx, dy, err };
+    }
+    // reject unreliable matches: barely better than "no movement", or the
+    // winner sits on the search boundary (runaway match on changed clouds)
+    if (best.err > err0 * 0.85 || Math.abs(best.dx) === R || Math.abs(best.dy) === R) return null;
+    const dtMin = (fB.time - fA.time) / 60;
+    const s = a.width / G / dtMin;
+    let vx = best.dx * s, vy = best.dy * s;          // full-res px per minute
+    // physical sanity cap: clouds rarely drift faster than ~90 km/h
+    const bp = state.satBounds;
+    if (bp) {
+      const swp = L.CRS.EPSG3857.project(bp.getSouthWest()), nep = L.CRS.EPSG3857.project(bp.getNorthEast());
+      const kmMin = Math.hypot(vx, vy) * ((nep.x - swp.x) / a.width) / 1000;
+      if (kmMin > 1.5) { const f = 1.5 / kmMin; vx *= f; vy *= f; }
+    }
+    return { vx, vy };
+  })();
+  return state.motion;
+}
+
+function makeForecastLayer(minAhead) {
+  const ov = L.imageOverlay(BLANK_PX, state.satBounds || map.getBounds().pad(PAD), { opacity: 0 });
+  (async () => {
+    const base = state.baseIso && await state.satData[state.baseIso];
+    if (!base) return;
+    const mot = await getMotion();
+    // clamp the shift to the off-viewport margin, so the mask's transparent
+    // edge can never slide into view and read as a fake cloud front
+    const margin = PAD / (1 + 2 * PAD);
+    let dx = (mot?.vx || 0) * minAhead, dy = (mot?.vy || 0) * minAhead;
+    const k = Math.min(1,
+      (base.width * margin - 2) / Math.max(1, Math.abs(dx)),
+      (base.height * margin - 2) / Math.max(1, Math.abs(dy)));
+    const c = document.createElement('canvas');
+    c.width = base.width; c.height = base.height;
+    const cx = c.getContext('2d');
+    cx.globalAlpha = Math.max(0.8, 1 - minAhead / 300);   // gentle fade with lead time; the "Prognose" tag carries the uncertainty
+    cx.drawImage(base, Math.round(dx * k), Math.round(dy * k));
+    ov.setUrl(c.toDataURL('image/png'));
+    remount(ov);
+  })();
+  return ov;
+}
+
+function preloadLayers() {
+  state.frames.forEach(f => {
+    if (f.satIso) getLayer('sat' + f.satIso, () => makeSatLayer(f.satIso));
+    if (f.fcMin != null) getLayer('fsat' + f.time, () => makeForecastLayer(f.fcMin));
+    if (f.radarPath) getLayer('radar' + f.radarPath, () => makeRadarLayer(f.radarPath));
+  });
 }
 
 // satellite images are view-dependent: rebuild them after pan/zoom
@@ -326,11 +438,12 @@ map.on('moveend', () => {
   clearTimeout(satRebuildTimer);
   satRebuildTimer = setTimeout(() => {
     Object.keys(state.layers).forEach(k => {
-      if (k.startsWith('sat')) { map.removeLayer(state.layers[k]); delete state.layers[k]; }
+      if (k.startsWith('sat') || k.startsWith('fsat')) { map.removeLayer(state.layers[k]); delete state.layers[k]; }
     });
+    state.satData = {}; state.motion = undefined; state.satBounds = null;
     if (state.frames.length) {
+      preloadLayers();
       showFrame(state.idx);
-      state.frames.forEach(f => { if (f.satIso) getLayer('sat' + f.satIso, () => makeSatLayer(f.satIso)); });
     }
   }, 400);
 });
@@ -349,16 +462,18 @@ function showFrame(i) {
   state.idx = i;
   const f = state.frames[i];
   if (!f) return;
-  const wantSat = satOn && f.satIso ? 'sat' + f.satIso : null;
+  const wantSat = !satOn ? null
+    : f.satIso ? 'sat' + f.satIso
+    : f.fcMin != null ? 'fsat' + f.time : null;
   const wantRadar = radarOn && f.radarPath ? 'radar' + f.radarPath : null;
-  if (wantSat) getLayer(wantSat, () => makeSatLayer(f.satIso));
+  if (wantSat) getLayer(wantSat, () => f.satIso ? makeSatLayer(f.satIso) : makeForecastLayer(f.fcMin));
   if (wantRadar) getLayer(wantRadar, () => makeRadarLayer(f.radarPath));
   Object.entries(state.layers).forEach(([key, lyr]) => {
     lyr.setOpacity(key === wantSat ? 0.9 : key === wantRadar ? 0.8 : 0);
   });
   $('timeline').value = i;
   $('frameLabel').innerHTML = fmtTime(f.time) +
-    (f.isNowcast ? '<span class="tag">Radar-Prognose</span>' : '<span class="tag past">beobachtet</span>');
+    (f.time * 1000 > state.satEnd ? '<span class="tag">Prognose</span>' : '<span class="tag past">beobachtet</span>');
 }
 
 function play() {
@@ -399,14 +514,16 @@ async function loadFrames() {
       fetch('https://api.rainviewer.com/public/weather-maps.json').then(r => r.json()).catch(() => null)
     ]);
     state.host = rv?.host || 'https://tilecache.rainviewer.com';
+    state.satEnd = satEnd;
     const radar = [...(rv?.radar?.past || []), ...(rv?.radar?.nowcast || [])];
-    const nowcastStart = (rv?.radar?.nowcast || [])[0]?.time ?? Infinity;
+    const nowcastPaths = new Set((rv?.radar?.nowcast || []).map(r => r.path));
     const nearestRadar = tUnix => {
       let best = null, bd = Infinity;
       for (const r of radar) { const d = Math.abs(r.time - tUnix); if (d < bd) { bd = d; best = r; } }
       return bd <= 6 * 60 ? best : null;
     };
 
+    // observed satellite frames (the sat feed runs ~30 min behind real time)
     const frames = [];
     for (let ms = satEnd - HISTORY_MIN * 60e3; ms <= satEnd; ms += STEP_MIN * 60e3) {
       const unix = Math.round(ms / 1000);
@@ -417,28 +534,46 @@ async function loadFrames() {
         isNowcast: false
       });
     }
-    // radar nowcast frames beyond the newest satellite image (rain forecast ~+30 min)
-    radar.filter(r => r.time >= nowcastStart && r.time * 1000 > satEnd)
-      .forEach(r => frames.push({ time: r.time, satIso: null, radarPath: r.path, isNowcast: true }));
+    state.baseIso = frames.at(-1).satIso;
+    // future frames past the newest satellite image: extrapolated clouds +
+    // radar (observed until ~now, RainViewer nowcast beyond)
+    const endMs = Math.max(Date.now() + FORECAST_MIN * 60e3,
+      ...(rv?.radar?.nowcast || []).map(r => r.time * 1000));
+    for (let ms = satEnd + STEP_MIN * 60e3; ms <= endMs; ms += STEP_MIN * 60e3) {
+      const unix = Math.round(ms / 1000);
+      const r = nearestRadar(unix);
+      frames.push({
+        time: unix,
+        satIso: null,
+        fcMin: Math.round((ms - satEnd) / 60e3),
+        radarPath: r?.path || null,
+        isNowcast: r ? nowcastPaths.has(r.path) : false
+      });
+    }
 
-    // drop layers that no longer belong to any frame
+    // drop layers/masks that no longer belong to any frame
     const wanted = new Set();
-    frames.forEach(f => { if (f.satIso) wanted.add('sat' + f.satIso); if (f.radarPath) wanted.add('radar' + f.radarPath); });
+    frames.forEach(f => {
+      if (f.satIso) wanted.add('sat' + f.satIso);
+      if (f.fcMin != null) wanted.add('fsat' + f.time);
+      if (f.radarPath) wanted.add('radar' + f.radarPath);
+    });
     Object.keys(state.layers).forEach(key => {
       if (!wanted.has(key)) { map.removeLayer(state.layers[key]); delete state.layers[key]; }
     });
+    Object.keys(state.satData).forEach(iso => { if (!wanted.has('sat' + iso)) delete state.satData[iso]; });
+    state.motion = undefined;
 
     state.frames = frames;
     $('timeline').max = frames.length - 1;
-    // preload
-    frames.forEach(f => {
-      if (f.satIso) getLayer('sat' + f.satIso, () => makeSatLayer(f.satIso));
-      if (f.radarPath) getLayer('radar' + f.radarPath, () => makeRadarLayer(f.radarPath));
-    });
-    const lastObserved = frames.map(f => f.isNowcast).lastIndexOf(false);
-    showFrame(lastObserved >= 0 ? lastObserved : 0);
-    $('status').textContent = 'Satellitenbild: ' + fmtTime(satEnd / 1000) + ' · Bilder ' +
-      fmtTime(frames[0].time) + '–' + fmtTime(frames.at(-1).time);
+    preloadLayers();
+    // open positioned at "now", not on the half-hour-old satellite frame
+    const nowU = Date.now() / 1000;
+    let nowIdx = 0;
+    frames.forEach((f, i) => { if (Math.abs(f.time - nowU) < Math.abs(frames[nowIdx].time - nowU)) nowIdx = i; });
+    showFrame(nowIdx);
+    $('status').textContent = 'Beobachtet bis ' + fmtTime(satEnd / 1000) +
+      ' · Prognose bis ' + fmtTime(frames.at(-1).time);
     if (wasPlaying || !state.timer) play();
     updateAdvice();   // storm scan on fresh radar frames
   } catch (e) {
