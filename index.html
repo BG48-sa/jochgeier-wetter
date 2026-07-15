@@ -792,22 +792,33 @@ async function updateAdvice() {
     if (h.cape[i] > maxCape) { maxCape = h.cape[i]; capeAt = h.time[i]; }
   }
 
-  let level = 'ok', main = '', detail = '';
+  let level = 'ok', main = '', detail = '', acute = false;
   const s = storm && !storm.none ? storm : null;
+  // real thunderstorm evidence: heavy convective radar core, or storm-grade CAPE.
+  // Without it, rain is a yellow notice — the siren must not cry wolf on drizzle.
+  const thundery = (s && s.strongNow) || maxCape >= 800;
   const icon = s && s.strongNow ? '⛈' : '🌧';
 
-  if (s && s.dist <= 5) {
-    level = 'danger';
-    main = `${icon} Zelle nur ${Math.max(1, Math.round(s.dist))} km entfernt (${dirTxt(s.bearing)}) – absteigen!`;
+  if (s && s.dist <= 5 && thundery) {
+    level = 'danger'; acute = true;
+    main = `⛈ Gewitterzelle nur ${Math.max(1, Math.round(s.dist))} km entfernt (${dirTxt(s.bearing)}) – absteigen!`;
     detail = 'Blitzschlaggefahr am Grat. Sofort tiefer gehen, Kuppen und freistehende Bäume meiden.';
-  } else if (s && s.eta !== null && s.eta <= 45 && (s.strongNow || maxCape >= 600)) {
-    level = 'danger';
+  } else if (s && s.eta !== null && s.eta <= 45 && thundery) {
+    level = 'danger'; acute = true;
     main = `⛈ Gewitter im Anzug aus ${dirTxt(s.bearing)}: Zelle in ${Math.round(s.dist)} km, bei dir in ca. ${Math.max(5, Math.round(s.eta / 5) * 5)} min`;
     detail = 'Jetzt aufbrechen: Sarner Skihütte ≈ 45 min, Putzen ≈ 1½ h Abstieg.';
+  } else if (rainInMin !== null && rainInMin <= 30 && thundery) {
+    level = 'danger'; acute = true;
+    main = rainInMin === 0 ? '⛈ Gewitterregen setzt ein – absteigen!' : `⛈ Gewitterlage: Niederschlag in ca. ${rainInMin} min`;
+    detail = `CAPE bis ${Math.round(maxCape)} J/kg – Radar unten prüfen, Zugrichtung der Zellen beachten.`;
+  } else if (s && s.dist <= 5) {
+    level = 'warn';
+    main = `🌧 Regen unmittelbar: Echo ${Math.max(1, Math.round(s.dist))} km entfernt (${dirTxt(s.bearing)})`;
+    detail = 'Kein Gewitterpotenzial erkennbar – nass, aber kein Grund zur Eile.';
   } else if (rainInMin !== null && rainInMin <= 30) {
-    level = 'danger';
-    main = rainInMin === 0 ? '🌧 Niederschlag jetzt – absteigen!' : `🌧 Niederschlag in ca. ${rainInMin} min`;
-    detail = 'Radar unten prüfen: Zugrichtung der Zellen beachten.';
+    level = 'warn';
+    main = rainInMin === 0 ? '🌧 Leichter Niederschlag' : `🌧 Niederschlag in ca. ${rainInMin} min`;
+    detail = 'Kein Gewitterpotenzial – Regenschutz genügt.';
   } else if (s && s.dist <= 25) {
     level = 'warn';
     main = `${icon} Zelle in ${Math.round(s.dist)} km (${dirTxt(s.bearing)})${s.eta ? `, nähert sich – ca. ${Math.round(s.eta / 5) * 5} min` : ', zieht derzeit nicht direkt heran'}`;
@@ -836,8 +847,7 @@ async function updateAdvice() {
   txt.textContent = main;
   det.textContent = detail;
 
-  // alarm on any danger condition involving approaching weather (not pure CAPE outlook)
-  const acute = level === 'danger' && (s ? (s.dist <= 5 || (s.eta !== null && s.eta <= 45)) : rainInMin !== null && rainInMin <= 30);
+  // siren only on acute thunderstorm conditions (never plain rain or CAPE outlook)
   if (alarmArmed && acute) fireAlarm(main);
   advBusy = false;
 }
